@@ -1,306 +1,488 @@
--- building controller
--- author: guy56890
+--[[
+by guy56890, october 29th through october 30th, 2025
+client-side building controller
+everything below is explained line-by-line
+]]
 
--- services
+local ReplicatedStorage = game:GetService("ReplicatedStorage") -- shared assets + remotes
+local UserInputService = game:GetService("UserInputService") -- keyboard / mouse input
+local Players = game:GetService("Players") -- player service
+local RunService = game:GetService("RunService") -- frame updates
+local CollectionService = game:GetService("CollectionService") -- tagging system
+local TweenService = game:GetService("TweenService") -- tween animations
+local DebrisService = game:GetService("Debris") -- auto cleanup instances
 
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local UserInputService = game:GetService("UserInputService")
-local CollectionService = game:GetService("CollectionService")
+local Player = Players.LocalPlayer -- this client
+local Char = Player.Character or Player.CharacterAdded:Wait() -- ensure character exists
+local Mouse = Player:GetMouse() -- mouse ray provider
 
--- player refs
+local PlayerUI = Player:WaitForChild("PlayerGui") -- UI container
+local BuildUI = PlayerUI:WaitForChild("BuildingUI") -- main build interface
 
-local Player = Players.LocalPlayer
-local Character = Player.Character or Player.CharacterAdded:Wait()
-local Mouse = Player:GetMouse()
+-- remote references used to communicate with server
+local BuildRemotes = ReplicatedStorage:WaitForChild("BuildRemotes")
+local TryPlace = BuildRemotes.TryPlace -- server validates and places object
+local DeleteBuild = BuildRemotes.DeletePlayerBuild -- deletes placed object
+local GetMaterialRequirements = BuildRemotes.GetMaterialRequirements -- returns material costs
+local UnlockedBuildings = BuildRemotes.UnlockedBuildings -- returns unlocked builds
 
--- remotes
+local HAMMER_TAG = "HAMMER" -- tag identifying the build tool
+local MAX_RANGE = 30 -- maximum build distance
+local Tool = nil -- current equipped hammer
 
-local Remotes = ReplicatedStorage:WaitForChild("BuildRemotes")
-local TryPlace = Remotes:WaitForChild("TryPlace")
-local DeleteBuild = Remotes:WaitForChild("DeletePlayerBuild")
+-- snapping + rotation configuration
+local SNAP_DISTANCE = 1 -- grid size when snapping enabled
+local SNAP_ROTATION = math.rad(15) -- rotation step when snapping
+local YawAngle = 0 -- accumulated rotation
+local YawSpeed = math.rad(60) -- degrees/sec converted to radians
 
--- config
+local OriginForward = Vector3.new(0,0,1) -- original forward vector of model
 
-local MAX_RANGE = 30
-local SNAP_DISTANCE = 0.5
-local SNAP_ROTATION = math.rad(15)
-local ROT_SPEED = math.rad(45)
-local HAMMER_TAG = "HAMMER"
+-- state flags controlling modes
+local Snapping = false
+local Deleting = false
+local Debugging = false
+local Continuous = false
 
--- state
+local CanPlacing = true -- whether placement currently valid
+local FolderName = nil -- folder random selection tracking
+local SearchText = ""
+local ErrorReason = ""
 
-local State = {
-	Tool = nil,
-	Preview = nil,
-	DeleteTarget = nil,
-	Yaw = 0,
-	Snapping = false,
-	Deleting = false,
-	CanPlace = false,
-	Keys = {Q=false,E=false},
-	Connections = {}
-}
+-- fetch build costs once
+local MaterialRequirements = GetMaterialRequirements:InvokeServer()
 
--- raycast setup
+-- gradients used for button feedback
+local RedColor = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(255,0,4)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(255,255,255))
+})
 
+local GreenColor = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(59,118,63)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(255,255,255))
+})
+
+local Assets = ReplicatedStorage:WaitForChild("BuildAssets")
+local BuildObjects = Assets:WaitForChild("BuildObjects")
+
+local SelectedObject = nil -- preview model
+local SelectedObjectForDeletion = nil -- hovered build during delete
+local PreviewOutOfRange = false
+local BuildRangeVisualizer = script:WaitForChild("BuildRangeVisualizer")
+
+-- raycast ignores player and NPC actors
+local CastParams = RaycastParams.new()
 CastParams.FilterType = Enum.RaycastFilterType.Exclude
-CastParams.FilterDescendantsInstances = {Character}
+CastParams.FilterDescendantsInstances = {Char, workspace.Actors}
 
--- utilities
+local BuildButtonTemplate = script.Template
+local TempConnections = {} -- temporary runtime connections
+local DebugConnections = {}
 
-local function DisconnectAll()
-	for _,c in State.Connections do
-		c:Disconnect()
-	end
-	table.clear(State.Connections)
-end
+-- tracks held rotation keys
+local KeysDown = {Q=false,E=false}
 
-local function Snap(v: Vector3, grid: number)
-	return Vector3.new(
-		math.round(v.X/grid)*grid,
-		math.round(v.Y/grid)*grid,
-		math.round(v.Z/grid)*grid
-	)
-end
+local Motor6D = nil -- replaces default grip weld
+local HoldAnimation = nil
 
--- preview colouring
+---------------------------------------------------------------------
+-- PREVIEW COLOR LOGIC
+---------------------------------------------------------------------
 
-local function SetInvalid(toggle)
-	if not State.Preview then return end
+local function SwapPreviewColor(valid)
+	assert(SelectedObject)
 
-	for _,p in State.Preview:GetDescendants() do
-		if not p:IsA("BasePart") then continue end
+	-- iterate through every visual descendant
+	for _, Part in SelectedObject:GetDescendants() do
 
-		local stored = p:GetAttribute("OriginalColor")
+		-- ignore objects that cannot visually change color
+		if not (Part:IsA("BasePart") or Part:IsA("Decal") or Part:IsA("Light") or Part:IsA("SurfaceAppearance")) then
+			continue
+		end
 
-		if toggle then
-			if not stored then
-				p:SetAttribute("OriginalColor", p.Color)
-				p.Color = Color3.new(1,0,0)
+		local OriginalColor = Part:GetAttribute("OriginalColor")
+
+		-- invalid placement -> tint red
+		if not valid then
+			if not OriginalColor then
+				if Part:IsA("Decal") then
+					Part:SetAttribute("OriginalColor", Part.Color3)
+					Part.Color3 = Color3.fromRGB(255,0,0)
+				else
+					Part:SetAttribute("OriginalColor", Part.Color)
+					Part.Color = Color3.fromRGB(255,0,0)
+				end
 			end
 		else
-			if stored then
-				p.Color = stored
-				p:SetAttribute("OriginalColor", nil)
+			-- restore original color if valid again
+			if OriginalColor then
+				if Part:IsA("Decal") then
+					Part.Color3 = OriginalColor
+				else
+					Part.Color = OriginalColor
+				end
+				Part:SetAttribute("OriginalColor", nil)
 			end
 		end
 	end
 end
 
--- placement validation
+---------------------------------------------------------------------
+-- SPACE CHECK
+---------------------------------------------------------------------
 
-local function ValidatePlacement(surfaceNormal: Vector3)
+local function IsSpaceFree()
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {SelectedObject}
 
-	local head = Character:WaitForChild("Head")
+	-- checks if preview boundary overlaps anything
+	local overlapping = workspace:GetPartsInPart(SelectedObject.Boundary, params)
 
-	local distance =
-		(State.Preview.PrimaryPart.Position - head.Position).Magnitude
-
-	local allowed = true
-
-	if distance > MAX_RANGE then
-		allowed = false
-	end
-
-	-- dot product measures alignment between vectors
-	-- dot = 1 means perfectly upward surface
-	-- dot = 0 means vertical wall
-	-- we reject steep angles
-
-	local dot = surfaceNormal:Dot(Vector3.yAxis)
-	local angle = math.acos(dot)
-
-	if angle > math.rad(45) then
-		allowed = false
-	end
-
-	State.CanPlace = allowed
-	SetInvalid(not allowed)
+	return #overlapping == 0
 end
 
--- preview creation
+---------------------------------------------------------------------
+-- PLACEMENT VALIDATION
+---------------------------------------------------------------------
 
-local function CreatePreview(model: Model)
+local function CanPlace(UpVector)
 
-	if State.Preview then
-		State.Preview:Destroy()
+	local preventPlacing = false
+
+	-- distance check
+	local Difference = SelectedObject.PrimaryPart.Position - Char.Head.Position
+	if Difference.Magnitude > MAX_RANGE then
+		preventPlacing = true
+		ErrorReason = "OUT OF RANGE"
 	end
 
-	local clone = model:Clone()
+	-- surface angle validation
+	local maxAngle = math.rad(45)
 
-	for _,p in clone:GetDescendants() do
-		if p:IsA("BasePart") then
-			p.Anchored = true
-			p.CanCollide = false
-			p.CanQuery = false
-			p.CanTouch = false
-			p.Transparency = math.clamp(p.Transparency+0.7,0,1)
+	-- dot product measures alignment between surface normal and world up
+	local angleFromUp = math.acos(UpVector:Dot(Vector3.new(0,1,0)))
+
+	if angleFromUp > maxAngle then
+		if not SelectedObject:GetAttribute("AllSurfaces") then
+			preventPlacing = true
+			ErrorReason = "INVALID SURFACE"
 		end
 	end
 
-	clone.Parent = workspace
-	State.Preview = clone
-	State.Yaw = 0
-end
-
--- orientation math
-
-local function ComputePlacementCF(position: Vector3, normal: Vector3)
-
-	-- we build a coordinate system aligned to the surface
-
-	-- step 1:
-	-- create forward vector rotated by user yaw
-	local forward =
-		(CFrame.Angles(0,State.Yaw,0) * Vector3.zAxis)
-
-	-- step 2:
-	-- remove vertical component from forward
-	-- this projects forward onto the surface plane
-	local projectedForward =
-		(forward - normal * forward:Dot(normal)).Unit
-
-	-- step 3:
-	-- cross product builds perpendicular axis
-	local right =
-		projectedForward:Cross(normal).Unit
-
-	-- step 4:
-	-- construct matrix from orthogonal basis
-	return CFrame.fromMatrix(position, right, normal)
-end
-
--- preview update
-
-local function UpdatePreview(dt)
-
-	local preview = State.Preview
-	if not preview then return end
-
-	local result = workspace:Raycast(
-		Mouse.UnitRay.Origin,
-		Mouse.UnitRay.Direction*1000,
-		CastParams
-	)
-
-	if not result then return end
-
-	local pos = result.Position
-	local normal = result.Normal
-
-	if State.Snapping then
-		pos = Snap(pos,SNAP_DISTANCE)
+	-- collision check
+	if not IsSpaceFree() then
+		preventPlacing = true
+		ErrorReason = "SPACE OCCUPIED"
 	end
 
-	if State.Keys.E then
-		State.Yaw += ROT_SPEED * dt
-	elseif State.Keys.Q then
-		State.Yaw -= ROT_SPEED * dt
+	if Debugging then
+		preventPlacing = false
+		ErrorReason = ""
 	end
 
-	local cf = ComputePlacementCF(pos,normal)
-
-	preview:PivotTo(cf * CFrame.Angles(0,State.Yaw,0))
-
-	ValidatePlacement(normal)
+	CanPlacing = not preventPlacing
+	SwapPreviewColor(CanPlacing)
 end
 
--- actions
+---------------------------------------------------------------------
+-- PREVIEW UPDATE (RUNS EVERY FRAME)
+---------------------------------------------------------------------
 
-local function Place()
-	if not State.Preview or not State.CanPlace then return end
+local function UpdatePreview(deltaTime)
 
-	local result = TryPlace:InvokeServer(
-		State.Preview.Name,
-		State.Preview:GetPivot()
-	)
+	if not SelectedObject then return end
+
+	-- raycast downward to position range visualizer
+	local groundRay =
+		workspace:Raycast(Char.HumanoidRootPart.Position, Vector3.new(0,-100,0), CastParams)
+
+	if groundRay then
+		BuildRangeVisualizer.Main.Position = groundRay.Position
+	end
+
+	-- mouse raycast determines placement location
+	local RayResult =
+		workspace:Raycast(Mouse.UnitRay.Origin, Mouse.UnitRay.Direction * 1000, CastParams)
+
+	if not RayResult then return end
+
+	local Position = RayResult.Position
+	local UpVector = RayResult.Normal
+
+	-- continuous rotation when holding keys
+	if KeysDown.E and not Snapping then
+		YawAngle += YawSpeed * deltaTime
+	end
+
+	if KeysDown.Q and not Snapping then
+		YawAngle -= YawSpeed * deltaTime
+	end
+
+	-- snap to grid
+	if Snapping then
+		Position = Vector3.new(
+			math.round(Position.X/SNAP_DISTANCE)*SNAP_DISTANCE,
+			Position.Y,
+			math.round(Position.Z/SNAP_DISTANCE)*SNAP_DISTANCE
+		)
+	end
+
+	-- rotate object's forward direction
+	local RotatedForward =
+		(CFrame.Angles(0,YawAngle,0) * OriginForward)
+
+	-- project forward vector onto surface plane
+	local ForwardVector =
+		(RotatedForward - UpVector * RotatedForward:Dot(UpVector)).Unit
+
+	-- compute perpendicular axis
+	local RightVector =
+		ForwardVector:Cross(UpVector).Unit
+
+	-- construct orientation matrix
+	local MatrixCFrame =
+		CFrame.fromMatrix(Position, RightVector, UpVector)
+
+	if not SelectedObject:GetAttribute("IgnoresRotation") then
+		SelectedObject:PivotTo(MatrixCFrame * CFrame.Angles(0,YawAngle,0))
+		CanPlace(UpVector)
+	else
+		local cf =
+			CFrame.new(Position) *
+			CFrame.Angles(0,YawAngle,0)
+
+		SelectedObject:PivotTo(cf)
+		CanPlace(Vector3.new(0,1,0))
+	end
+end
+
+---------------------------------------------------------------------
+-- PREVIEW CREATION
+---------------------------------------------------------------------
+
+local function CreatePreview(object)
+
+	assert(object)
+	if Deleting then return end
+
+	if SelectedObject then
+		SelectedObject:Destroy()
+	end
+
+	-- folder = choose random variant
+	if object:IsA("Folder") then
+		FolderName = object.Name
+		local children = object:GetChildren()
+		SelectedObject = children[math.random(#children)]:Clone()
+	else
+		FolderName = nil
+		SelectedObject = object:Clone()
+	end
+
+	-- convert into ghost preview
+	for _, obj in SelectedObject:GetDescendants() do
+
+		if obj:IsA("Weld") or obj:IsA("WeldConstraint") then
+			obj:Destroy()
+		end
+
+		if obj:IsA("BasePart") then
+			obj.Anchored = true
+			obj.CanCollide = false
+			obj.CanTouch = false
+			obj.CanQuery = false
+			obj.Transparency = math.clamp(obj.Transparency + 0.7,0,1)
+		end
+
+		if obj:IsA("Light") then
+			obj.Enabled = false
+		end
+	end
+
+	SelectedObject.Parent = workspace.Temp
+
+	OriginForward =
+		SelectedObject.PrimaryPart and SelectedObject.PrimaryPart.CFrame.LookVector
+		or Vector3.new(0,0,1)
+
+	YawAngle = 0
+end
+
+---------------------------------------------------------------------
+-- PREVIEW CLEANUP
+---------------------------------------------------------------------
+
+local function EndPreview()
+	if SelectedObject then
+		SelectedObject:Destroy()
+		SelectedObject = nil
+	end
+
+	BuildRangeVisualizer.Parent = script
+end
+
+---------------------------------------------------------------------
+-- TOOL ACTIVATION (PLACEMENT)
+---------------------------------------------------------------------
+
+local function Activated()
+
+	-- deletion mode
+	if Deleting then
+		if not SelectedObjectForDeletion then return end
+		DeleteBuild:FireServer(SelectedObjectForDeletion, Debugging)
+		return
+	end
+
+	if not SelectedObject then return end
+
+	-- placement rejected
+	if not CanPlacing then
+		return
+	end
+
+	local Parent = nil
+
+	-- allow attaching to another player build
+	if Mouse.Target
+	and CollectionService:HasTag(
+		Mouse.Target:FindFirstAncestorOfClass("Model"),
+		"PLAYER_BUILD"
+	) then
+		Parent = Mouse.Target:FindFirstAncestorOfClass("Model")
+	end
+
+	local result =
+		TryPlace:InvokeServer(
+			SelectedObject.Name,
+			SelectedObject:GetPivot(),
+			Parent,
+			FolderName,
+			Debugging
+		)
 
 	if result == "SUCCESS" then
-		State.Preview:Destroy()
-		State.Preview = nil
-	end
-end
-
-local function DeleteSelected()
-	if State.DeleteTarget then
-		DeleteBuild:FireServer(State.DeleteTarget)
-	end
-end
-
--- input
-
-local function InputBegan(input,gpe)
-	if gpe then return end
-
-	if input.KeyCode == Enum.KeyCode.E then
-		State.Keys.E = true
-
-	elseif input.KeyCode == Enum.KeyCode.Q then
-		State.Keys.Q = true
-
-	elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
-		if State.Deleting then
-			DeleteSelected()
+		if not Continuous then
+			EndPreview()
 		else
-			Place()
+			CreatePreview(BuildObjects:FindFirstChild(SelectedObject.Name))
 		end
 	end
 end
 
-local function InputEnded(input)
-	if input.KeyCode == Enum.KeyCode.E then
-		State.Keys.E = false
-	elseif input.KeyCode == Enum.KeyCode.Q then
-		State.Keys.Q = false
-	end
-end
+---------------------------------------------------------------------
+-- EQUIP / UNEQUIP
+---------------------------------------------------------------------
 
--- tool lifecycle
+local function Equipped()
 
-local function Equipped(tool)
-
-	State.Tool = tool
+	BuildUI.Enabled = true
 
 	table.insert(
-		State.Connections,
+		TempConnections,
+		Tool.Activated:Connect(Activated)
+	)
+
+	table.insert(
+		TempConnections,
 		RunService.RenderStepped:Connect(UpdatePreview)
 	)
 
-	table.insert(
-		State.Connections,
-		UserInputService.InputBegan:Connect(InputBegan)
-	)
+	-- replaces default grip with Motor6D so animations work
+	if Tool:HasTag("REAL") then
+		local Weld = Char.RightHand:WaitForChild("RightGrip")
 
-	table.insert(
-		State.Connections,
-		UserInputService.InputEnded:Connect(InputEnded)
-	)
+		Motor6D = Instance.new("Motor6D")
+		Motor6D.Parent = Char.RightHand
+		Motor6D.Name = "RightGrip"
+		Motor6D.Part0 = Weld.Part0
+		Motor6D.Part1 = Weld.Part1
+		Motor6D.C0 = Weld.C0
+		Motor6D.C1 = Weld.C1
+
+		Weld:Destroy()
+
+		HoldAnimation =
+			Char.Humanoid.Animator:LoadAnimation(script.Animations.Hold)
+
+		HoldAnimation:Play()
+	end
 end
 
 local function Unequipped()
 
-	DisconnectAll()
+	EndPreview()
+	BuildUI.Enabled = false
 
-	if State.Preview then
-		State.Preview:Destroy()
-		State.Preview = nil
+	for _, c in TempConnections do
+		c:Disconnect()
 	end
 
-	State.Tool = nil
+	table.clear(TempConnections)
+
+	if Motor6D then
+		Motor6D:Destroy()
+		HoldAnimation:Stop()
+		HoldAnimation = nil
+	end
 end
 
--- tool detection
+---------------------------------------------------------------------
+-- CHARACTER TOOL DETECTION
+---------------------------------------------------------------------
 
-Character.ChildAdded:Connect(function(child)
-	if CollectionService:HasTag(child,HAMMER_TAG) then
-		Equipped(child)
+local function ChildAdded(child)
+	if CollectionService:HasTag(child, HAMMER_TAG) then
+		Tool = child
+		Equipped()
 	end
-end)
+end
 
-Character.ChildRemoved:Connect(function(child)
-	if child == State.Tool then
+local function ChildRemoved(child)
+	if CollectionService:HasTag(child, HAMMER_TAG) then
+		Tool = nil
 		Unequipped()
 	end
-end)
+end
+
+---------------------------------------------------------------------
+-- INPUT HANDLING
+---------------------------------------------------------------------
+
+local function InputBegan(input, processed)
+	if processed or not SelectedObject then return end
+
+	if input.KeyCode == Enum.KeyCode.E then
+		if Snapping then
+			YawAngle += SNAP_ROTATION
+		end
+		KeysDown.E = true
+	elseif input.KeyCode == Enum.KeyCode.Q then
+		if Snapping then
+			YawAngle -= SNAP_ROTATION
+		end
+		KeysDown.Q = true
+	end
+end
+
+local function InputEnded(input)
+	if not SelectedObject then return end
+
+	if input.KeyCode == Enum.KeyCode.E then
+		KeysDown.E = false
+	elseif input.KeyCode == Enum.KeyCode.Q then
+		KeysDown.Q = false
+	end
+end
+
+---------------------------------------------------------------------
+-- CONNECTIONS
+---------------------------------------------------------------------
+
+Char.ChildAdded:Connect(ChildAdded)
+Char.ChildRemoved:Connect(ChildRemoved)
+
+UserInputService.InputBegan:Connect(InputBegan)
+UserInputService.InputEnded:Connect(InputEnded)
