@@ -1,92 +1,62 @@
 -- building controller
 -- author: guy56890
 
--- Services expose Roblox engine systems as singleton objects.
--- GetService is the canonical way to access them; indexing game directly
--- (e.g. game.Players) works but is less reliable across environments.
-local Players          = game:GetService("Players")
-local RunService       = game:GetService("RunService")
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local UserInputService = game:GetService("UserInputService")
+local UserInputService  = game:GetService("UserInputService")
 local CollectionService = game:GetService("CollectionService")
 
--- LocalPlayer is only valid inside a LocalScript running on the client.
--- It is the root of all per-player data: character, backpack, GUI, etc.
 local Player    = Players.LocalPlayer
-
--- Player.Character may already exist if this script runs after the first spawn.
--- CharacterAdded:Wait() yields the coroutine until the event fires if not.
--- The `or` short-circuits to the yield only when Character is nil/false.
+-- Character might already exist by the time this script runs, so we fall
+-- back to waiting on CharacterAdded if it doesn't
 local Character = Player.Character or Player.CharacterAdded:Wait()
-
--- GetMouse returns a Mouse object that exposes UnitRay (a Ray from the camera
--- through the cursor) and Hit (the last raycast CFrame). UnitRay is preferred
--- for manual raycasts because it pairs cleanly with workspace:Raycast.
+-- UnitRay gives us a direction from the camera through the cursor, which
+-- is what we use for the placement raycast each frame
 local Mouse = Player:GetMouse()
 
--- RemoteEvents and RemoteFunctions live in ReplicatedStorage so both the
--- server and every client can reference the same instances.
--- WaitForChild yields until replication completes, preventing nil errors on join.
+-- WaitForChild because these remotes replicate from the server and might
+-- not exist yet the moment this script runs on the client
 local Remotes     = ReplicatedStorage:WaitForChild("BuildRemotes")
-
--- RemoteFunction (InvokeServer): client calls, server responds, result returned.
--- Used for placement because the server must validate and confirm authority-side.
+-- InvokeServer because placement needs a round trip, the server validates
+-- the request and tells us whether it worked
 local TryPlace    = Remotes:WaitForChild("TryPlace")
-
--- RemoteEvent (FireServer): one-way message from client to server, no return.
--- Deletion only needs to signal intent; the server handles the actual removal.
+-- FireServer is fine for deletion since we don't need a response back
 local DeleteBuild = Remotes:WaitForChild("DeletePlayerBuild")
 
--- MAX_RANGE caps how far from the player's head a placement can be confirmed.
--- Prevents abuse such as placing through walls from a distance.
+-- how far from the player's head a placement can be confirmed
 local MAX_RANGE     = 30
-
--- SNAP_DISTANCE is the world-space grid size in studs for positional snapping.
--- A value of 0.5 means builds snap to half-stud intervals on each axis.
+-- world grid size in studs for positional snapping
 local SNAP_DISTANCE = 0.5
-
--- SNAP_ROTATION is the angular grid step in radians (15 degrees).
--- math.rad(d) = d * (math.pi / 180), converting degrees to the radians
--- that all Roblox trig and CFrame functions expect.
+-- rotation snap increment, 15 degree steps
 local SNAP_ROTATION = math.rad(15)
-
--- ROT_SPEED is the continuous yaw rate when Q or E is held, in radians/second.
--- At 45 deg/s the player makes a full 360 rotation in 8 seconds.
+-- yaw speed in radians per second when Q or E is held
 local ROT_SPEED     = math.rad(45)
-
--- HAMMER_TAG is the CollectionService tag applied to tool instances that
--- activate build mode. Using tags decouples detection from naming conventions,
--- so any tool tagged "HAMMER" works regardless of its AssetId or Name.
+-- the CollectionService tag we look for to activate build mode
+-- doing it this way means any tool with this tag works, not just ones with a specific name
 local HAMMER_TAG = "HAMMER"
 
--- State centralises all mutable runtime data in one table.
--- This avoids scattered module-level variables, makes state easy to inspect,
--- and lets reset/cleanup functions address everything in one place.
+-- all mutable runtime state lives here so nothing bleeds into the module scope
+-- and cleanup stays straightforward
 local State = {
-	Tool        = nil,            -- the currently equipped tool Instance, or nil
-	Preview     = nil,            -- the ghost Model shown before confirming placement
-	DeleteTarget = nil,           -- the build Model currently hovered in delete mode
-	Yaw         = 0,              -- accumulated rotation around world Y, in radians
-	Snapping    = false,          -- true when the player has grid-snap toggled on
-	Deleting    = false,          -- true when the player is in delete mode
-	CanPlace    = false,          -- validity flag, updated every frame
-	Keys        = {Q=false, E=false}, -- held-key state for continuous rotation
-	Connections = {}              -- stores RBXScriptConnections for grouped cleanup
+	Tool         = nil,
+	Preview      = nil,
+	DeleteTarget = nil,
+	Yaw          = 0,
+	Snapping     = false,
+	Deleting     = false,
+	CanPlace     = false,
+	Keys         = {Q = false, E = false},
+	Connections  = {}
 }
 
--- RaycastParams controls which parts the ray can hit.
--- Exclude mode means the list is a blocklist; every part NOT in the list
--- is eligible for intersection. We exclude the character so the preview
--- ray never registers hits on the player's own limbs.
+-- exclude the local character so the placement ray never hits our own body
 local CastParams = RaycastParams.new()
 CastParams.FilterType = Enum.RaycastFilterType.Exclude
 CastParams.FilterDescendantsInstances = {Character}
 
--- DisconnectAll severs every stored RBXScriptConnection at once, then
--- empties the table. table.clear resets length to 0 without reallocating,
--- which is more efficient than assigning a new table.
--- This must be called on unequip to stop per-frame callbacks and prevent
--- memory leaks from listeners holding references after the tool is gone.
+-- severs every stored connection at once and clears the table
+-- called on unequip so we're not running a per-frame callback with no tool equipped
 local function DisconnectAll()
 	for _, c in State.Connections do
 		c:Disconnect()
@@ -94,10 +64,8 @@ local function DisconnectAll()
 	table.clear(State.Connections)
 end
 
--- Snap quantises a Vector3 to the nearest multiple of `grid` on each axis.
--- math.round returns the nearest integer n such that n = round(v/grid),
--- then multiplying back by grid restores the scale.
--- Example: Snap(Vector3.new(1.3, 0, 2.7), 0.5) → (1.5, 0, 2.5)
+-- rounds each axis of a Vector3 to the nearest multiple of `grid`
+-- so builds align to a consistent world grid
 local function Snap(v: Vector3, grid: number): Vector3
 	return Vector3.new(
 		math.round(v.X / grid) * grid,
@@ -106,40 +74,31 @@ local function Snap(v: Vector3, grid: number): Vector3
 	)
 end
 
--- SnapYaw rounds the accumulated yaw to the nearest SNAP_ROTATION step.
--- Works by the same quantise pattern as Snap: divide, round, multiply back.
--- This produces discrete 15-degree yaw increments when snap mode is active
--- and no rotation key is held.
+-- same idea as Snap but for the yaw angle, locks it to 15 degree increments
 local function SnapYaw(yaw: number): number
 	return math.round(yaw / SNAP_ROTATION) * SNAP_ROTATION
 end
 
--- SetInvalid tints every BasePart in the preview red when `toggle` is true,
--- and restores original colours when false.
---
--- Instance Attributes are key-value pairs stored directly on an instance,
--- surviving parenting changes and replication. They accept most Roblox value
--- types including Color3, making them suitable for per-part colour caches
--- without needing an external lookup table.
+-- tints the entire preview red when placement is invalid and restores original
+-- colours when it becomes valid again
+-- we cache each part's original colour as an instance attribute rather than a
+-- separate lookup table because attributes travel with the instance, no bookkeeping needed
 local function SetInvalid(toggle: boolean)
 	if not State.Preview then return end
 
 	for _, p in State.Preview:GetDescendants() do
 		if not p:IsA("BasePart") then continue end
 
-		-- GetAttribute returns nil if the attribute does not exist.
 		local stored = p:GetAttribute("OriginalColor")
 
 		if toggle then
-			-- Only cache and tint if not already tinted, preventing repeated
-			-- writes that would overwrite the cached original with red.
+			-- only cache and tint if we haven't already, otherwise we'd overwrite
+			-- the cached original with red on a repeated call
 			if not stored then
 				p:SetAttribute("OriginalColor", p.Color)
 				p.Color = Color3.new(1, 0, 0)
 			end
 		else
-			-- Restore only if a cached colour exists, then delete the attribute
-			-- to signal the part is back to its original state.
 			if stored then
 				p.Color = stored
 				p:SetAttribute("OriginalColor", nil)
@@ -148,21 +107,14 @@ local function SetInvalid(toggle: boolean)
 	end
 end
 
--- ValidatePlacement checks two independent conditions each frame:
+-- checks two things: distance from the player's head and surface slope
+-- if either fails, placement is blocked and the preview turns red
 --
--- 1. Distance: the preview's PrimaryPart must be within MAX_RANGE of the
---    player's head. PrimaryPart is set in Studio and acts as the model's
---    pivot reference; its Position gives the model's effective world origin.
---
--- 2. Slope: the surface normal must be within 45 degrees of world-up.
---    The dot product of two unit vectors equals cos(θ) where θ is the angle
---    between them. math.acos recovers θ from that cosine. We clamp the dot
---    product to [-1, 1] first because floating-point errors can push it
---    slightly outside that range, which would cause math.acos to return NaN.
---    A result > 45 degrees means the surface is too steep (wall or ceiling).
---
--- State.CanPlace and the preview tint are both updated here to keep all
--- validity logic in one place.
+-- the slope check uses the dot product between the surface normal and world up
+-- the dot product of two unit vectors equals the cosine of the angle between them
+-- so math.acos gets us the actual angle in radians
+-- we clamp the dot value before passing it to math.acos because floating point
+-- drift can push it just outside the valid range and cause it to return NaN
 local function ValidatePlacement(surfaceNormal: Vector3)
 	local head = Character:WaitForChild("Head")
 
@@ -175,10 +127,10 @@ local function ValidatePlacement(surfaceNormal: Vector3)
 		allowed = false
 	end
 
-	-- Vector3.yAxis is the constant unit vector (0, 1, 0).
 	local dot   = surfaceNormal:Dot(Vector3.yAxis)
 	local angle = math.acos(math.clamp(dot, -1, 1))
 
+	-- anything steeper than 45 degrees counts as a wall or ceiling
 	if angle > math.rad(45) then
 		allowed = false
 	end
@@ -187,15 +139,10 @@ local function ValidatePlacement(surfaceNormal: Vector3)
 	SetInvalid(not allowed)
 end
 
--- CreatePreview clones the source model to produce a non-colliding ghost
--- that follows the cursor. Every BasePart is configured so it:
---   • Anchored = true   — not simulated by the physics solver
---   • CanCollide = false — no physical collision response
---   • CanQuery = false   — excluded from workspace:Raycast results
---   • CanTouch = false   — does not fire Touched events
--- Transparency is raised by 0.7 and clamped so models that are already
--- partially transparent do not exceed 1.0 (fully invisible).
--- State.Yaw resets to 0 so each new preview starts unrotated.
+-- clones the model and strips all collision and query flags from its parts
+-- so it acts purely as a visual ghost with no effect on gameplay raycasts
+-- transparency is nudged up and clamped in case the source model already has
+-- partially transparent parts that would exceed 1 otherwise
 local function CreatePreview(model: Model)
 	if State.Preview then
 		State.Preview:Destroy()
@@ -205,43 +152,28 @@ local function CreatePreview(model: Model)
 
 	for _, p in clone:GetDescendants() do
 		if p:IsA("BasePart") then
-			p.Anchored      = true
-			p.CanCollide    = false
-			p.CanQuery      = false
-			p.CanTouch      = false
-			p.Transparency  = math.clamp(p.Transparency + 0.7, 0, 1)
+			p.Anchored     = true
+			p.CanCollide   = false
+			p.CanQuery     = false
+			p.CanTouch     = false
+			p.Transparency = math.clamp(p.Transparency + 0.7, 0, 1)
 		end
 	end
 
-	clone.Parent   = workspace
-	State.Preview  = clone
-	State.Yaw      = 0
+	clone.Parent  = workspace
+	State.Preview = clone
+	State.Yaw     = 0
 end
 
--- ComputePlacementCF builds a CFrame whose up axis (Y column) aligns to the
--- hit surface normal, so placed objects sit flush on any angled surface.
+-- builds a CFrame that aligns to the hit surface so objects sit flush on any
+-- angle rather than always defaulting to world-up orientation
 --
--- Step 1 — Yawed forward vector:
---   CFrame.Angles(0, yaw, 0) is a rotation-only CFrame (no translation).
---   Multiplying a Vector3 by a CFrame applies the rotation to the vector.
---   This rotates world-forward (0,0,1) by the current yaw around world Y.
---
--- Step 2 — Project onto the surface plane:
---   A vector projected onto a plane with unit normal n is:
---     v_proj = v - n * (v · n)
---   Subtracting the component parallel to n leaves only the in-plane part.
---   .Unit normalises to length 1, required for CFrame.fromMatrix.
---
--- Step 3 — Right axis via cross product:
---   The cross product of two non-parallel vectors produces a third vector
---   perpendicular to both, following the right-hand rule.
---   projectedForward × normal gives a vector lying in the surface plane,
---   perpendicular to the forward direction — this is our right axis.
---
--- Step 4 — CFrame.fromMatrix(pos, rightVec, upVec):
---   Constructs a CFrame from an origin and explicit right/up column vectors.
---   The look vector (third column) is inferred as right × up, completing
---   an orthonormal basis. The result orients the model to the surface.
+-- we start by rotating the forward vector by the current yaw, then project it
+-- onto the surface plane by removing any component that points along the normal
+-- v - n*(v dot n) strips the normal-aligned part and leaves only the in-plane part
+-- from there a cross product of the projected forward and the normal gives us
+-- the right axis, and CFrame.fromMatrix assembles the full orientation from those
+-- two orthogonal basis vectors
 local function ComputePlacementCF(position: Vector3, normal: Vector3): CFrame
 	local forward =
 		(CFrame.Angles(0, State.Yaw, 0) * Vector3.zAxis)
@@ -255,24 +187,13 @@ local function ComputePlacementCF(position: Vector3, normal: Vector3): CFrame
 	return CFrame.fromMatrix(position, right, normal)
 end
 
--- UpdatePreview runs every RenderStepped (before the frame is rendered).
--- dt is the elapsed seconds since the last frame, used to scale rotation so
--- it is frame-rate independent regardless of the client's FPS.
---
--- Execution order each frame:
---   1. Early-exit if no preview exists.
---   2. Raycast from cursor into the world.
---   3. Optionally snap the hit position to the grid.
---   4. Accumulate or snap yaw based on key state and snap mode.
---   5. Compute a surface-aligned CFrame and pivot the preview to it.
---   6. Run placement validation to update CanPlace and tint.
+-- runs every RenderStepped frame and moves the preview to wherever the cursor
+-- is pointing, applying snapping and rotation along the way
+-- dt is delta time in seconds so rotation speed stays consistent regardless of framerate
 local function UpdatePreview(dt: number)
 	local preview = State.Preview
 	if not preview then return end
 
-	-- workspace:Raycast(origin, direction, params) returns a RaycastResult
-	-- containing Position, Normal, Instance, and Material, or nil on miss.
-	-- A direction length of 1000 studs covers any reasonable view distance.
 	local result = workspace:Raycast(
 		Mouse.UnitRay.Origin,
 		Mouse.UnitRay.Direction * 1000,
@@ -284,41 +205,34 @@ local function UpdatePreview(dt: number)
 	local pos    = result.Position
 	local normal = result.Normal
 
-	-- Quantise world position to SNAP_DISTANCE grid when snapping is active.
 	if State.Snapping then
 		pos = Snap(pos, SNAP_DISTANCE)
 	end
 
-	-- Continuous rotation: accumulate yaw scaled by dt so speed is consistent
-	-- at any frame rate. += is Luau syntactic sugar for State.Yaw = State.Yaw + …
+	-- scale rotation by dt so holding E at 120fps doesn't rotate twice as fast as at 60fps
 	if State.Keys.E then
 		State.Yaw += ROT_SPEED * dt
 	elseif State.Keys.Q then
 		State.Yaw -= ROT_SPEED * dt
 	end
 
-	-- Discrete rotation snap: when snapping is on and no rotation key is held,
-	-- lock yaw to the nearest 15-degree step. This uses the SNAP_ROTATION
-	-- constant to give precise angular alignment without continuous drift.
+	-- when snapping is on and neither key is held, lock yaw to the nearest 15 degree
+	-- step so the rotation feels intentional rather than stopping at a random angle
 	if State.Snapping and not State.Keys.E and not State.Keys.Q then
 		State.Yaw = SnapYaw(State.Yaw)
 	end
 
-	-- PivotTo repositions the entire model relative to its PivotOffset,
-	-- maintaining all parts' relative positions within the model.
-	-- Yaw is already baked into the basis vectors inside ComputePlacementCF,
-	-- so no additional CFrame.Angles rotation is applied here.
+	-- yaw is already baked into ComputePlacementCF via the rotated forward vector
+	-- so we just call PivotTo once with the finished surface-aligned CFrame
 	local cf = ComputePlacementCF(pos, normal)
 	preview:PivotTo(cf)
 
 	ValidatePlacement(normal)
 end
 
--- Place invokes the server-side TryPlace handler with the model name and its
--- current world CFrame from GetPivot. GetPivot returns the CFrame of the model's
--- pivot point, which is what was set by PivotTo.
--- The server is authoritative: it validates, spawns the real instance, and
--- returns "SUCCESS". On success the preview ghost is destroyed on the client.
+-- sends the placement request to the server with the model name and its current
+-- world CFrame, then destroys the local preview if the server confirms success
+-- the server is authoritative so the real instance is always spawned server-side
 local function Place()
 	if not State.Preview or not State.CanPlace then return end
 
@@ -333,18 +247,14 @@ local function Place()
 	end
 end
 
--- DeleteSelected fires the delete remote with the currently targeted build.
--- FireServer is asynchronous and returns immediately; the server handles removal.
 local function DeleteSelected()
 	if State.DeleteTarget then
 		DeleteBuild:FireServer(State.DeleteTarget)
 	end
 end
 
--- InputBegan fires for every input event the engine receives.
--- gpe (GameProcessedEvent) is true when the engine has already consumed the
--- input — for example, a click inside a ScreenGui or a keypress in the chat.
--- Returning early prevents accidental placements or deletions during UI use.
+-- gpe being true means the engine already consumed the input, usually because
+-- the chat or a UI element was focused, so we bail early to avoid interfering
 local function InputBegan(input: InputObject, gpe: boolean)
 	if gpe then return end
 
@@ -355,8 +265,6 @@ local function InputBegan(input: InputObject, gpe: boolean)
 		State.Keys.Q = true
 
 	elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
-		-- Branch on mode: delete mode fires the delete remote,
-		-- otherwise attempt placement confirmation.
 		if State.Deleting then
 			DeleteSelected()
 		else
@@ -365,8 +273,7 @@ local function InputBegan(input: InputObject, gpe: boolean)
 	end
 end
 
--- InputEnded resets the held-key flags so rotation stops when Q or E is
--- released. Not resetting these would cause perpetual rotation after release.
+-- just resets the held key flags so rotation stops when the key comes up
 local function InputEnded(input: InputObject)
 	if input.KeyCode == Enum.KeyCode.E then
 		State.Keys.E = false
@@ -375,15 +282,9 @@ local function InputEnded(input: InputObject)
 	end
 end
 
--- Equipped is called when a tagged hammer enters the character.
--- It registers the three connections needed during active build mode.
--- table.insert appends each RBXScriptConnection to State.Connections so
--- DisconnectAll can clean them up as a batch on unequip.
---
--- RenderStepped fires every frame before rendering; it receives dt and is
--- the correct signal for per-frame visual updates like preview positioning.
--- InputBegan/Ended are sourced from UserInputService rather than the tool's
--- own events so Q/E still register even when the cursor is over a part.
+-- registers the three connections needed while a hammer is active
+-- storing them in State.Connections means DisconnectAll handles everything
+-- in one call rather than us having to track each handle separately
 local function Equipped(tool: Tool)
 	State.Tool = tool
 
@@ -403,9 +304,8 @@ local function Equipped(tool: Tool)
 	)
 end
 
--- Unequipped tears down all connections, destroys the ghost preview, and
--- clears the Tool reference. Called whenever the hammer leaves the character:
--- manual unequip, switching tools, death, or server kick.
+-- tears everything down when the tool leaves the character, whether that's
+-- from unequipping, switching tools, dying, or being kicked
 local function Unequipped()
 	DisconnectAll()
 
@@ -417,19 +317,16 @@ local function Unequipped()
 	State.Tool = nil
 end
 
--- Character.ChildAdded fires when any Instance is parented to the character.
--- CollectionService:HasTag checks for the "HAMMER" tag at equip time,
--- so any tool with that tag activates build mode without name-matching.
+-- using a CollectionService tag instead of checking the tool name means
+-- any tool tagged HAMMER activates build mode without caring what it's called
 Character.ChildAdded:Connect(function(child)
 	if CollectionService:HasTag(child, HAMMER_TAG) then
 		Equipped(child)
 	end
 end)
 
--- Character.ChildRemoved fires when a child leaves the character hierarchy.
--- We compare the removed child against State.Tool by identity (==), which is
--- an exact reference comparison, to confirm it is the active hammer rather
--- than any other tool or accessory that might be removed at the same time.
+-- comparing by identity against State.Tool rather than re-checking the tag
+-- because we only want to call Unequipped if it's actually the hammer we were tracking
 Character.ChildRemoved:Connect(function(child)
 	if child == State.Tool then
 		Unequipped()
